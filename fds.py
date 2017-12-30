@@ -241,7 +241,7 @@ def _tests(fds_mount):
     try:
         s.write_record(file_id=8,
                        record_key=1234,
-                       data=b"This data won't fit.")
+                       data=b"This data won't fit."*8)
     except FDSException as e:
         assert e.args[0] == FDS_ERR_NO_SPACE_IN_FLASH
     else:
