@@ -11,8 +11,9 @@ CRC_SRC ?= $(SDK)/components/libraries/crc16
 
 SOURCE_FILES = $(FDS_SRC)/fds.c \
 	$(CRC_SRC)/crc16.c \
-	python_ops.c \
-	sdk_config.h
+	python_ops.c
+
+NONSOURCE_FILES = sdk_config.h fds_config.h
 
 DUMMY = ./.dummy
 
@@ -25,13 +26,13 @@ INCLUDES = -I . \
 DEFAULT = fds_x86.so fds_x86_64.so
 default: $(DEFAULT)
 
-TAGS: $(SOURCE_FILES)
+TAGS: $(SOURCE_FILES) $(NONSOURCE_FILES)
 	etags `find $(SDK)/ | grep \\\.[ch]$$` $(SOURCE_FILES)
 
-fds_x86_64.so: $(SOURCE_FILES) $(DUMMY)
+fds_x86_64.so: $(SOURCE_FILES) $(NONSOURCE_FILES) $(DUMMY)
 	$(CC) -g3 -std=gnu99 -m64 -fPIC -shared $(INCLUDES) -o $@ $(SOURCE_FILES) -lm
 
-fds_x86.so: $(SOURCE_FILES) $(DUMMY)
+fds_x86.so: $(SOURCE_FILES) $(NONSOURCE_FILES) $(DUMMY)
 	$(CC) -g3 -std=gnu99 -m32 -shared $(INCLUDES) -o $@ $(SOURCE_FILES) -lm
 
 $(DUMMY): Makefile
