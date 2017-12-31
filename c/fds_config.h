@@ -22,6 +22,9 @@
  * @brief   Configuration options for FDS.
  */
 
+#define CRC16_ENABLED 1
+#define FDS_CRC_ENABLED 1
+
 /**@brief   Configures the size of the internal queue. */
 #define FDS_OP_QUEUE_SIZE           (4)
 

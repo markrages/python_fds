@@ -1,284 +1,232 @@
 #!/usr/bin/python3
 
-import ctypes
+import struct
+import os
 
-import os,sys,copy,math
-this_path = os.path.dirname(os.path.realpath(__file__))
+page_magic = struct.pack('<I',0xdeadc0de)
+swap_magic = struct.pack('<I',0xf11e01ff)
+data_magic = struct.pack('<I',0xf11e01fe)
 
-assert(0==os.system('cd "%s" && make default' % this_path))
+def guess_page_size(image):
+    pages = image.split(page_magic)
+    if len(pages[0]):
+        return False # Should start with page_magic
+    pagelens = [len(p) + len(page_magic) for p in pages[1:]]
+    uniqlens = set(pagelens)
+    if len(uniqlens) != 1:
+        return False # All pages not same length
+    pagelen = uniqlens.pop()
+    if pagelen % 256:
+        return False # Page length not divisible by smallest physical page
 
-fds_lib = None
-libnames = ['fds_x86_64.so','fds_x86.so']
+    return pagelen//4 # Return value in words.
 
-while libnames:
-    so = libnames.pop()
-    try:
-        fds_lib = ctypes.CDLL(os.path.join(this_path,so))
-        break
-    except OSError: # load failed
-        if not libnames:
-            raise
+def crc16_compute(data):
+    """Straight port of the bank CRC used by DFU
 
-# Errors from fds.h
-errtab = {}
-for errno, (name, desc) in enumerate(
-        [("FDS_SUCCESS",                "The operation completed successfully."),
-         ("FDS_ERR_OPERATION_TIMEOUT",  "The operation timed out."),
-         ("FDS_ERR_NOT_INITIALIZED",    "The module has not been initialized."),
-         ("FDS_ERR_UNALIGNED_ADDR",     "The input data is not aligned to a word boundary."),
-         ("FDS_ERR_INVALID_ARG",        "The parameter contains invalid data."),
-         ("FDS_ERR_NULL_ARG",           "The parameter is NULL."),
-         ("FDS_ERR_NO_OPEN_RECORDS",    "The record is not open, so it cannot be closed."),
-         ("FDS_ERR_NO_SPACE_IN_FLASH",  "There is no space in flash memory."),
-         ("FDS_ERR_NO_SPACE_IN_QUEUES", "There is no space in the internal queues."),
-         ("FDS_ERR_RECORD_TOO_LARGE",   "The record exceeds the maximum allowed size."),
-         ("FDS_ERR_NOT_FOUND",          "The record was not found."),
-         ("FDS_ERR_NO_PAGES",           "No flash pages are available."),
-         ("FDS_ERR_USER_LIMIT_REACHED", "The maximum number of users has been reached."),
-         ("FDS_ERR_CRC_CHECK_FAILED",   "The CRC check failed."),
-         ("FDS_ERR_BUSY",               "The underlying flash subsystem was busy."),
-         ("FDS_ERR_INTERNAL",           "An internal error occurred."),
-        ]):
-    locals()[name]=errno
-    errtab[errno] = name, desc
+    data is a sequence or generator of integer in 0..255
+    """
+    crc = 0xffff
+    for d in data:
+        crc = (crc >> 8 & 0xff) | (crc << 8 & 0xff00)
+        crc ^= d
+        crc ^= (crc & 0xff) >> 4 & 0xff
+        crc ^= crc << 12 & 0xffff
+        crc ^= (crc & 0xff) << 5
 
-class FDSException(Exception):
-    def __init__(self, errno):
-        try:
-            name, desc = errtab[errno]
-        except KeyError:
-            name = "FDS_UNKNOWN_%d"%errno
-            desc = "Unknown error #%d"%errno
-        self.args = errno,name,desc
+    return crc
 
-class Fds(object):
-    def __init__(self, image=None):
-        size = fds_lib.api_fs_size()
-        if image:
-            if len(image) != size:
-                raise Exception("Image must be exactly %d bytes."%size)
+def getcrc(record):
+    crcrecord = record[:6]+record[8:]
+    return crc16_compute(crcrecord)
+
+def decode_records(image, virtual_page_size, crc_check=False):
+    page_size = 4 * virtual_page_size # in bytes
+    assert len(image) % page_size == 0
+    for page_start in range(0, len(image), page_size):
+        page = image[page_start:page_start+page_size]
+        if not page.startswith(page_magic): # bogus page
+            continue
+        if not page[4:8]==data_magic: # not data page, swap maybe
+            continue
+        page = page[8:]
+        while len(page)>=12:
+            key,length,file_id,crc,record_id = struct.unpack('<HHHHI',page[:12])
+            length *= 4
+
+            if len(page) < 12+length:
+                page = page[12:]
+                continue # partial data / illegal length
+
+            record,page = page[:12+length],page[12+length:]
+            data = record[12:]
+
+            if file_id == 0xffff: # invalid
+                continue
+            if key == 0x0000: # deleted
+                continue
+
+            if crc_check and crc != getcrc(record):
+                raise Exception("CRC Fail")
+
+            yield {'file_id':file_id,
+                   'key':key,
+                   'record_id':record_id,
+                   'data':data}
+
+def encode_records(records, pages, virtual_page_size):
+    page_size = 4*virtual_page_size
+    image = b''
+
+    i=0
+    for page_start in range(0, page_size * pages, page_size):
+        page_image = page_magic[:]
+        if (page_start==0):
+            page_image += swap_magic
         else:
-            image = b'\xff'*size
+            page_image += data_magic
 
-        self.mount(image)
+            while i<len(records):
+                if len(records[i]['data'])+12 + len(page_image) > page_size:
+                    break
+                record = records[i]
+                data = record['data'][:]
+                while len(data)%4:
+                    data += b'\0'
+                crc = getcrc(struct.pack('<HHHHI',
+                                          record['key'],
+                                          len(data)//4,
+                                          record['file_id'],
+                                          0,
+                                          1+i)+record['data'])
+                page_image += struct.pack('<HHHHI',
+                                          record['key'],
+                                          len(data)//4,
+                                          record['file_id'],
+                                          crc,
+                                          1+i)
+                page_image += record['data']
+                i+=1
+
+        pad_len = page_size - len(page_image)
+        image += page_image
+        image += b'\xff'*pad_len
+
+    if i < len(records):
+        raise Exception("All records do not fit.")
+
+    return image
+
+class Fds():
+    def __init__(self,
+                 image=None,
+                 virtual_page_size=None, # In 32-bit words
+                 virtual_pages=None):
+        self.image = image
+        self.virtual_page_size = virtual_page_size
+        self.virtual_pages = virtual_pages
+
+        if self.image:
+            self.mount(self.image)
+        else:
+            self.records = []
 
     def mount(self, image):
-        """Supply an image (as bytes) to mount as fds filesystem.
+        if not self.virtual_page_size:
+            self.virtual_page_size = guess_page_size(image)
+        if not self.virtual_pages:
+            assert len(image) % 256 == 0
+            assert len(image)//4 % self.virtual_page_size == 0
+            self.virtual_pages = (len(image)//4)//self.virtual_page_size
 
-        All bytes = 255 for a new filesystem"""
-
-        size = fds_lib.api_fs_size()
-        assert len(image) == size
-
-        self.im = ctypes.create_string_buffer(image, size)
-        fds_lib.api_fds_mount.restype = ctypes.c_int
-
-        result = fds_lib.api_fds_mount(self.im)
-
-        if result:
-            raise FDSException(result)
+        self.records = list(decode_records(image, self.virtual_page_size))
 
     def unmount(self):
         pass
 
     def dir(self):
-        """Gets a list of record_ids, not too meaningful by themselves.
-        See read_all() for a more useful function."""
-
-        entries=[]
-        def collect_entry(record_id):
-            entries.append(int(record_id))
-
-        EntryCallback = ctypes.CFUNCTYPE(None,
-                                         ctypes.c_uint32, # record_id
-        )
-        entry_cb = EntryCallback(collect_entry)
-
-        result = fds_lib.api_fds_dir(entry_cb)
-
-        if result:
-            raise FDSException(result)
-
-        return entries
+        return list(range(len(self.records)))
 
     def write_record(self, record_key, file_id, data):
-
-        pad_len = (4-len(data)%4)%4
-        data += b'\0'*pad_len
-
-        assert 0 == len(data)%4
-        assert 0 <= record_key < 0x10000
-        assert 0 <= file_id < 0x10000
-
-        result = fds_lib.api_write_record(record_key,
-                                          file_id,
-                                          data,
-                                          len(data)//4)
-        if result:
-            raise FDSException(result)
+        while len(data)%4:
+            data += b'\0'
+        self.records.append({'file_id':file_id,
+                             'key':record_key,
+                             'record_id': len(self.records),
+                             'data':data})
 
     def update_record(self, record_id, data):
-        "Replaces a record by creating a new one and deleting the old one"
-        pad_len = (4-len(data)%4)%4
-        data += b'\0'*pad_len
-
-        assert 0 == len(data)%4
-        assert 0 <= record_id < 0x100000000
-
-        result = fds_lib.api_update_record(record_id,
-                                          data,
-                                          len(data)//4)
-        if result:
-            raise FDSException(result)
+        self.records[record_id]['data']=data
 
     def read_record(self, record_id):
-        "Reads an individual record given the record_id"
-        key = ctypes.c_uint16()
-        file_id = ctypes.c_uint16()
-        data = ctypes.POINTER(ctypes.c_uint8)()
-        data_len_words = ctypes.c_int()
-
-        result = fds_lib.api_get_record(record_id,
-                                        ctypes.byref(file_id),
-                                        ctypes.byref(key),
-                                        ctypes.byref(data_len_words),
-                                        ctypes.byref(data))
-
-        if result:
-            raise FDSException(result)
-
-        file_id = int(file_id.value)
-        key = int(key.value)
-        data_len_words = int(data_len_words.value)
-        data = bytes(data[i] for i in range(4*data_len_words))
-
-        return file_id,key,data
-
+        record = self.records[record_id]
+        return record['file_id'],record['key'],record['data']
 
     def read_all(self):
-        "Returns a list-of-dicts of all records"
-        ret = []
-        for record_id in self.dir():
-            file_id,key,data = self.read_record(record_id)
-            ret.append({'file_id':file_id,
-                        'key':key,
-                        'record_id':record_id,
-                        'data':data})
-        return ret
+        return self.records
 
     def delete_record(self, record_id):
-        "Removes a single record."
-        result = fds_lib.api_del_record(record_id)
-        if result:
-            raise FDSException(result)
+        del self.records[record_id]
 
     def delete_file(self, file_id):
-        "Marks all records belonging to file as deleted."
-        result = fds_lib.api_del_file(file_id)
-        if result:
-            raise FDSException(result)
+        self.records = [r for r in self.records if r['file_id'] != file_id]
 
     def gc(self):
-        "Garbage collect."
-        result = fds_lib.api_gc()
-        if result:
-            raise FDSException(result)
+        "garbage-collect, no-op."
+        pass
+
+    @property
+    def contents(self):
+        return encode_records(self.records,
+                              self.virtual_pages,
+                              self.virtual_page_size)
 
     def hd(self):
         "Prints a hexdump of the image to stdout using 'hd'"
         with open('/tmp/image.bin','wb') as fd:
-            fd.write(self.im)
-        os.system('hd < /tmp/image.bin')
+            fd.write(self.contents)
+        os.system('hd < /tmp/image.bin | tee /tmp/hexdump1')
+        return open('/tmp/hexdump1').read()
 
-def _tests(fds_mount):
-    s = fds_mount
+def _crc_tests():
+    import c.fds as cfds
+    a = b'asdfhlakjshflaskjdhfla12346521845ASDFSADFsadf'
+    py = crc16_compute(a)
+    c = cfds.crc16_compute(a)
+    assert py == c
 
-    ids = s.dir()
-    assert len(ids)==0
+def _tests():
+    _crc_tests()
+    _rw_tests()
 
-    s.write_record(file_id=6,
+def _rw_tests():
+    import c.fds as cfds
+
+    cfd = cfds.Fds()
+    cfd.write_record(file_id=6,
                    record_key=100,
                    data=b"Hello World.")
+    cfd.write_record(file_id=6,
+                   record_key=2100,
+                   data=b"Hello World. 2")
+    # cfd.hd()
 
-    ids = s.dir()
-    assert len(ids)==1
-    fid,key,data = s.read_record(ids[0])
+    fd = Fds(bytes(cfd.im))
+
+    ids = fd.dir()
+    assert len(ids)==2
+    fid,key,data = fd.read_record(ids[0])
     assert fid==6
     assert key==100
     assert data==b"Hello World."
 
-    s.write_record(file_id=6,
-                   record_key=100,
-                   data=b"Hello World2.")
-    ids = s.dir()
-    print(ids)
-    assert len(ids)==2
-    s.delete_record(ids[-1])
-    ids = s.dir()
-    assert len(ids)==1
+    assert cfd.read_all() == fd.read_all()
 
-    k = 0
-    while 1:
-        try:
-            s.write_record(record_key=100,
-                           file_id=6,
-                           data=("Hello World %d."%k).encode())
-        except FDSException as e:
-            if e.args[0] == FDS_ERR_NO_SPACE_IN_FLASH:
-                break
-            else:
-                raise
-        k += 1
+    cfd2 = cfds.Fds(fd.contents)
+    assert fd.read_all() == cfd2.read_all()
 
-    assert len(s.dir())==1+k
-
-    s.gc()
-    assert len(s.dir())==1+k
-
-    s.delete_file(6)
-    assert len(s.dir())==0
-
-    try:
-        s.write_record(file_id=8,
-                       record_key=1234,
-                       data=b"This data won't fit."*8)
-    except FDSException as e:
-        assert e.args[0] == FDS_ERR_NO_SPACE_IN_FLASH
-    else:
-        assert False # didn't get the exception we wanted
-
-    s.gc() # now records will fit
-
-    s.write_record(file_id=66,
-                   record_key=234,
-                   data=b"This is the first data.")
-
-    ids = s.dir()
-    assert len(ids)==1
-
-    s.update_record(ids[0],
-                    data=b"This is the second data.")
-
-    ids = s.dir()
-    assert len(ids)==1
-
-    fid,key,data = s.read_record(ids[0])
-    assert fid==66
-    assert key==234
-    assert data==b"This is the second data."
-
-    s.write_record(file_id=66,
-                   record_key=234,
-                   data=b"This is the third data.")
-
-    all_data = s.read_all()
-    assert len(all_data)==2
-    assert all_data[0]['file_id']==66
-    assert all_data[0]['key']==234
-    assert all_data[0]['data']==b"This is the second data."
-
-    s.hd()
+    # fd.hd()
+    print("pass")
 
 if __name__=="__main__":
-    fs = Fds()
-    _tests(fs)
+    _tests()
